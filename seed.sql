@@ -146,3 +146,7 @@ INSERT OR IGNORE INTO achievements (student_id, date, title, kind) VALUES
 INSERT OR IGNORE INTO settings (key, value) VALUES
   ('center_name', 'مركز السنة للعلوم الشرعية وتأهيل الدعاة'),
   ('center_sub', 'شبوة - عتق');
+
+
+-- تحديث فوري لقيمة اسم الفرع في قاعدة البيانات الحالية
+UPDATE settings SET value = 'شبوة - عتق' WHERE key = 'center_sub';
