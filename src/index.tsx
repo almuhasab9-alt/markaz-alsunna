@@ -15,6 +15,46 @@ const app = new Hono<{ Bindings: Bindings; Variables: { user: UserRow } }>()
 
 app.use('/api/*', cors())
 
+// ───────── ترويسات الأمان ─────────
+app.use('*', async (c, next) => {
+  await next()
+  c.header('X-Content-Type-Options', 'nosniff')
+  c.header('X-Frame-Options', 'DENY')
+  c.header('Referrer-Policy', 'strict-origin-when-cross-origin')
+  c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+})
+
+// ───────── معالجة الأخطاء — لا نسرّب تفاصيل داخلية ─────────
+app.onError((err, c) => {
+  console.error(err)
+  if (c.req.path.startsWith('/api/')) return c.json({ error: 'حدث خطأ داخلي، حاول مجدداً' }, 500)
+  return c.text('حدث خطأ غير متوقع', 500)
+})
+
+// ───────── تحديد معدل محاولات الدخول (حماية من التخمين) ─────────
+const loginAttempts = new Map<string, { count: number; resetAt: number }>()
+function checkLoginRate(key: string): boolean {
+  const now = Date.now()
+  if (loginAttempts.size > 5000) loginAttempts.clear()
+  const rec = loginAttempts.get(key)
+  if (!rec || rec.resetAt < now) {
+    loginAttempts.set(key, { count: 1, resetAt: now + 10 * 60 * 1000 })
+    return true
+  }
+  rec.count += 1
+  return rec.count <= 8
+}
+
+// ───────── أدوات التحقق من المدخلات ─────────
+const isEmail = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e)
+const isDate = (d: any) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)
+const cleanPhone = (p: any): string | null => String(p ?? '').replace(/[^0-9+]/g, '').slice(0, 16) || null
+const clampStr = (s: any, max = 120): string | null => String(s ?? '').trim().slice(0, max) || null
+const clampNum = (v: any, min: number, max: number): number | null => {
+  const n = Number(v)
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : null
+}
+
 // ───────── المصادقة ─────────
 async function getSessionUser(c: any): Promise<UserRow | null> {
   const token = getCookie(c, 'session')
@@ -50,12 +90,27 @@ async function teacherCircleId(db: D1Database, userId: number): Promise<number |
   return circle ? circle.id : null
 }
 
+// مساعد: هل الطالب ضمن حلقة المعلم؟ (المدير يملك كل شيء)
+async function teacherOwnsStudent(db: D1Database, user: UserRow, studentId: any): Promise<boolean> {
+  if (user.role === 'admin') return true
+  const cid = await teacherCircleId(db, user.id)
+  if (cid == null || !studentId) return false
+  const s = await db.prepare('SELECT circle_id FROM students WHERE id = ?').bind(studentId).first<any>()
+  return !!s && s.circle_id === cid
+}
+
 // تسجيل الدخول
 app.post('/api/login', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown'
+  if (!checkLoginRate(ip)) {
+    return c.json({ error: 'محاولات كثيرة جداً — انتظر 10 دقائق ثم حاول مجدداً' }, 429)
+  }
   const { email, password } = await c.req.json().catch(() => ({}))
-  if (!email || !password) return c.json({ error: 'أدخل البريد وكلمة المرور' }, 400)
+  if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
+    return c.json({ error: 'أدخل البريد وكلمة المرور' }, 400)
+  }
   const user = await c.env.DB.prepare('SELECT * FROM users WHERE email = ? AND active = 1')
-    .bind(String(email).trim().toLowerCase()).first<UserRow>()
+    .bind(email.trim().toLowerCase().slice(0, 120)).first<UserRow>()
   if (!user || !(await verifyPassword(password, user.salt, user.password_hash))) {
     return c.json({ error: 'بيانات الدخول غير صحيحة' }, 401)
   }
@@ -63,7 +118,10 @@ app.post('/api/login', async (c) => {
   const ttl = 1000 * 60 * 60 * 24 * 14 // 14 يوم
   await c.env.DB.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)')
     .bind(token, user.id, Date.now() + ttl).run()
-  setCookie(c, 'session', token, { httpOnly: true, path: '/', maxAge: ttl / 1000, sameSite: 'Lax' })
+  setCookie(c, 'session', token, {
+    httpOnly: true, path: '/', maxAge: ttl / 1000, sameSite: 'Lax',
+    secure: c.req.url.startsWith('https'),
+  })
   return c.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role } })
 })
 
@@ -77,6 +135,23 @@ app.post('/api/logout', async (c) => {
 app.get('/api/me', requireAuth, (c) => {
   const u = c.get('user')
   return c.json({ user: { id: u.id, name: u.name, email: u.email, role: u.role } })
+})
+
+// تغيير كلمة المرور (لأي مستخدم مسجّل)
+app.post('/api/change-password', requireAuth, async (c) => {
+  const b = await c.req.json().catch(() => ({}))
+  const u = c.get('user')
+  if (!b.current || !b.new_password) return c.json({ error: 'أدخل كلمة المرور الحالية والجديدة' }, 400)
+  if (String(b.new_password).length < 6) return c.json({ error: 'كلمة المرور الجديدة 6 أحرف على الأقل' }, 400)
+  const ok = await verifyPassword(b.current, u.salt, u.password_hash)
+  if (!ok) return c.json({ error: 'كلمة المرور الحالية غير صحيحة' }, 400)
+  const salt = randomSalt()
+  const hash = await hashPassword(b.new_password, salt)
+  await c.env.DB.prepare('UPDATE users SET password_hash = ?, salt = ? WHERE id = ?').bind(hash, salt, u.id).run()
+  // إبطال كل الجلسات الأخرى عدا الحالية
+  const token = getCookie(c, 'session')
+  if (token) await c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?').bind(u.id, token).run()
+  return c.json({ ok: true })
 })
 
 app.get('/api/settings', requireAuth, async (c) => {
@@ -145,19 +220,24 @@ app.get('/api/students', requireAuth, async (c) => {
 })
 
 app.post('/api/students', requireRole('admin'), async (c) => {
-  const b = await c.req.json()
-  if (!b.name) return c.json({ error: 'الاسم مطلوب' }, 400)
+  const b = await c.req.json().catch(() => ({}))
+  const name = clampStr(b.name, 100)
+  if (!name) return c.json({ error: 'الاسم مطلوب' }, 400)
+  const age = b.age != null && b.age !== '' ? clampNum(b.age, 3, 40) : null
   const r = await c.env.DB.prepare(
     `INSERT INTO students (name, age, parent_phone, parent_whatsapp, circle_id, notes) VALUES (?,?,?,?,?,?)`
-  ).bind(b.name, b.age ?? null, b.parent_phone ?? null, b.parent_whatsapp ?? null, b.circle_id ?? null, b.notes ?? null).run()
+  ).bind(name, age, cleanPhone(b.parent_phone), cleanPhone(b.parent_whatsapp), b.circle_id ? +b.circle_id : null, clampStr(b.notes, 500)).run()
   return c.json({ id: r.meta.last_row_id })
 })
 
 app.put('/api/students/:id', requireRole('admin'), async (c) => {
-  const b = await c.req.json()
+  const b = await c.req.json().catch(() => ({}))
+  const name = clampStr(b.name, 100)
+  if (!name) return c.json({ error: 'الاسم مطلوب' }, 400)
+  const age = b.age != null && b.age !== '' ? clampNum(b.age, 3, 40) : null
   await c.env.DB.prepare(
     `UPDATE students SET name=?, age=?, parent_phone=?, parent_whatsapp=?, circle_id=?, notes=? WHERE id=?`
-  ).bind(b.name, b.age ?? null, b.parent_phone ?? null, b.parent_whatsapp ?? null, b.circle_id ?? null, b.notes ?? null, c.req.param('id')).run()
+  ).bind(name, age, cleanPhone(b.parent_phone), cleanPhone(b.parent_whatsapp), b.circle_id ? +b.circle_id : null, clampStr(b.notes, 500), c.req.param('id')).run()
   return c.json({ ok: true })
 })
 
@@ -210,15 +290,17 @@ app.get('/api/teachers', requireRole('admin'), async (c) => {
 })
 
 app.post('/api/teachers', requireRole('admin'), async (c) => {
-  const b = await c.req.json()
+  const b = await c.req.json().catch(() => ({}))
   if (!b.name || !b.email || !b.password) return c.json({ error: 'الاسم والبريد وكلمة المرور مطلوبة' }, 400)
-  const email = String(b.email).trim().toLowerCase()
+  const email = String(b.email).trim().toLowerCase().slice(0, 120)
+  if (!isEmail(email)) return c.json({ error: 'صيغة البريد الإلكتروني غير صحيحة' }, 400)
+  if (String(b.password).length < 6) return c.json({ error: 'كلمة المرور 6 أحرف على الأقل' }, 400)
   const exists = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first()
   if (exists) return c.json({ error: 'البريد مسجّل مسبقاً' }, 400)
   const salt = randomSalt()
   const hash = await hashPassword(b.password, salt)
   const ur = await c.env.DB.prepare('INSERT INTO users (name, email, password_hash, salt, role) VALUES (?,?,?,?,?)')
-    .bind(b.name, email, hash, salt, 'teacher').run()
+    .bind(clampStr(b.name, 100), email, hash, salt, 'teacher').run()
   const tr = await c.env.DB.prepare('INSERT INTO teachers (user_id, name, phone) VALUES (?,?,?)')
     .bind(ur.meta.last_row_id, b.name, b.phone ?? null).run()
   return c.json({ id: tr.meta.last_row_id, user_id: ur.meta.last_row_id })
@@ -229,6 +311,7 @@ app.put('/api/teachers/:id', requireRole('admin'), async (c) => {
   await c.env.DB.prepare('UPDATE teachers SET name = ?, phone = ? WHERE id = ?')
     .bind(b.name, b.phone ?? null, c.req.param('id')).run()
   if (b.password) {
+    if (String(b.password).length < 6) return c.json({ error: 'كلمة المرور 6 أحرف على الأقل' }, 400)
     const t = await c.env.DB.prepare('SELECT user_id FROM teachers WHERE id = ?').bind(c.req.param('id')).first<any>()
     if (t?.user_id) {
       const salt = randomSalt()
@@ -251,9 +334,11 @@ app.delete('/api/teachers/:id', requireRole('admin'), async (c) => {
 
 // ───────── أولياء الأمور (إنشاء حساب وربطه بطالب) ─────────
 app.post('/api/parents', requireRole('admin'), async (c) => {
-  const b = await c.req.json()
+  const b = await c.req.json().catch(() => ({}))
   if (!b.name || !b.email || !b.password || !b.student_id) return c.json({ error: 'كل الحقول مطلوبة' }, 400)
-  const email = String(b.email).trim().toLowerCase()
+  const email = String(b.email).trim().toLowerCase().slice(0, 120)
+  if (!isEmail(email)) return c.json({ error: 'صيغة البريد الإلكتروني غير صحيحة' }, 400)
+  if (String(b.password).length < 6) return c.json({ error: 'كلمة المرور 6 أحرف على الأقل' }, 400)
   const exists = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first()
   if (exists) return c.json({ error: 'البريد مسجّل مسبقاً' }, 400)
   const salt = randomSalt()
@@ -319,11 +404,24 @@ app.get('/api/attendance', requireAuth, async (c) => {
 
 // حفظ حضور جماعي ليوم واحد
 app.post('/api/attendance', requireRole('admin', 'teacher'), async (c) => {
-  const b = await c.req.json()
-  const date = b.date || new Date().toISOString().slice(0, 10)
-  const items: any[] = b.items || []
+  const b = await c.req.json().catch(() => ({}))
+  const date = isDate(b.date) ? b.date : new Date().toISOString().slice(0, 10)
+  const items: any[] = Array.isArray(b.items) ? b.items.slice(0, 500) : []
   const u = c.get('user')
   if (!items.length) return c.json({ error: 'لا توجد بيانات' }, 400)
+  // المعلم لا يسجّل حضور طلاب خارج حلقته
+  if (u.role === 'teacher') {
+    const cid = await teacherCircleId(c.env.DB, u.id)
+    if (cid == null) return c.json({ error: 'حسابك غير مرتبط بحلقة' }, 403)
+    const ids = [...new Set(items.map((i) => +i.student_id).filter(Boolean))]
+    if (ids.length) {
+      const placeholders = ids.map(() => '?').join(',')
+      const res = await c.env.DB.prepare(
+        `SELECT COUNT(*) c FROM students WHERE id IN (${placeholders}) AND circle_id = ?`
+      ).bind(...ids, cid).first<any>()
+      if (!res || res.c !== ids.length) return c.json({ error: 'لا يمكنك تسجيل حضور طلاب خارج حلقتك' }, 403)
+    }
+  }
   const stmts = items
     .filter((i) => ['present', 'absent', 'late', 'excused'].includes(i.status))
     .map((i) => c.env.DB.prepare(
@@ -354,25 +452,36 @@ app.get('/api/memorization', requireAuth, async (c) => {
 })
 
 app.post('/api/memorization', requireRole('admin', 'teacher'), async (c) => {
-  const b = await c.req.json()
+  const b = await c.req.json().catch(() => ({}))
   if (!b.student_id) return c.json({ error: 'الطالب مطلوب' }, 400)
   const u = c.get('user')
-  const date = b.date || new Date().toISOString().slice(0, 10)
+  if (!(await teacherOwnsStudent(c.env.DB, u, b.student_id))) {
+    return c.json({ error: 'هذا الطالب ليس ضمن حلقتك' }, 403)
+  }
+  const date = isDate(b.date) ? b.date : new Date().toISOString().slice(0, 10)
+  const parts = clampNum(b.parts_count ?? 0, 0, 1) ?? 0
+  const evaluation = ['excellent', 'very_good', 'good', 'needs_review'].includes(b.evaluation) ? b.evaluation : null
   const r = await c.env.DB.prepare(
     `INSERT INTO memorization (student_id, date, type, surah_from, ayah_from, surah_to, ayah_to, parts_count, evaluation, notes, created_by)
      VALUES (?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(b.student_id, date, b.type === 'review' ? 'review' : 'new',
-    b.surah_from ?? null, b.ayah_from ?? null, b.surah_to ?? null, b.ayah_to ?? null,
-    b.parts_count ?? 0, b.evaluation ?? null, b.notes ?? null, u.id).run()
+  ).bind(+b.student_id, date, b.type === 'review' ? 'review' : 'new',
+    clampStr(b.surah_from, 40), clampNum(b.ayah_from, 1, 286), clampStr(b.surah_to, 40), clampNum(b.ayah_to, 1, 286),
+    parts, evaluation, clampStr(b.notes, 500), u.id).run()
   // إنجاز: إتمام سورة
   if (b.completed_surah) {
     await c.env.DB.prepare('INSERT INTO achievements (student_id, date, title, kind) VALUES (?,?,?,?)')
-      .bind(b.student_id, date, `أتم سورة ${b.completed_surah}`, 'surah').run()
+      .bind(+b.student_id, date, `أتم سورة ${clampStr(b.completed_surah, 40)}`, 'surah').run()
   }
   return c.json({ id: r.meta.last_row_id })
 })
 
 app.delete('/api/memorization/:id', requireRole('admin', 'teacher'), async (c) => {
+  const row = await c.env.DB.prepare('SELECT student_id FROM memorization WHERE id = ?').bind(c.req.param('id')).first<any>()
+  if (!row) return c.json({ error: 'السجل غير موجود' }, 404)
+  const u = c.get('user')
+  if (!(await teacherOwnsStudent(c.env.DB, u, row.student_id))) {
+    return c.json({ error: 'لا تملك الصلاحية على هذا السجل' }, 403)
+  }
   await c.env.DB.prepare('DELETE FROM memorization WHERE id = ?').bind(c.req.param('id')).run()
   return c.json({ ok: true })
 })
@@ -435,6 +544,9 @@ app.get('/api/reports/circle/:id', requireRole('admin'), async (c) => {
   return c.json({ from, to, circle, students: students.results })
 })
 
+// ───────── مسارات API غير المعروفة — 404 JSON ─────────
+app.all('/api/*', (c) => c.json({ error: 'المسار غير موجود' }, 404))
+
 // ───────── الملفات الثابتة ─────────
 app.use('/static/*', serveStatic({ root: './public' }))
 app.use('/manifest.webmanifest', serveStatic({ path: './public/manifest.webmanifest' }))
@@ -452,7 +564,7 @@ app.get('*', (c) => {
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>مركز السنة لتحفيظ القرآن الكريم</title>
+  <title>مركز السنة للعلوم الشرعية وتأهيل الدعاة</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" type="image/png" href="/static/icon-192.png">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
@@ -465,12 +577,16 @@ app.get('*', (c) => {
   </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;600;700;900&family=Amiri:wght@400;700&display=swap" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/css/all.min.css" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
   <style>
-    * { font-family: 'Cairo', sans-serif; -webkit-tap-highlight-color: transparent; }
+    * { font-family: 'Cairo', sans-serif; -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+    html, body { max-width: 100%; overflow-x: hidden; }
     body { background: #f4f7f6; }
+    img { max-width: 100%; height: auto; }
+    button, a { touch-action: manipulation; }
+    input, select, textarea { font-size: 16px; } /* منع التكبير التلقائي في iOS */
     .islamic-pattern { background-image: radial-gradient(circle at 50% 50%, rgba(13,92,77,.06) 1px, transparent 1px); background-size: 22px 22px; }
     .gold-gradient { background: linear-gradient(135deg, #d4af37, #b8942a); }
     .primary-gradient { background: linear-gradient(135deg, #0f766e, #0a4a3f); }
@@ -505,8 +621,9 @@ app.get('*', (c) => {
 <body class="islamic-pattern">
   <div id="splash">
     <img src="/static/logo.png" alt="مركز السنة" class="splash-logo" style="width:220px;max-width:70vw;background:white;border-radius:1.5rem;padding:1rem;box-shadow:0 20px 60px rgba(0,0,0,.35)">
-    <div class="text-white mt-6 font-black text-xl">مركز السنة لتحفيظ القرآن الكريم</div>
-    <div class="text-gold-300 mt-2 text-sm tracking-widest">﴿ خَيْرُكُمْ مَنْ تَعَلَّمَ الْقُرْآنَ وَعَلَّمَهُ ﴾</div>
+    <div class="text-white mt-6 font-black text-xl text-center px-4">مركز السنة للعلوم الشرعية وتأهيل الدعاة</div>
+    <div class="text-gold-300 mt-2 text-sm text-center px-4">﴿ خَيْرُكُمْ مَنْ تَعَلَّمَ الْقُرْآنَ وَعَلَّمَهُ ﴾</div>
+    <noscript><div class="text-white mt-4 font-bold">فعّل JavaScript لاستخدام التطبيق</div></noscript>
   </div>
   <div id="app"></div>
   <script src="/static/app.js"></script>

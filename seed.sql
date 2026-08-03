@@ -1,4 +1,4 @@
--- بيانات تجريبية — مركز السنة لتحفيظ القرآن الكريم
+-- بيانات تجريبية — مركز السنة للعلوم الشرعية وتأهيل الدعاة
 -- كلمة المرور لجميع الحسابات التجريبية: 123456
 -- (pbkdf2-sha256, 100000 iterations, salt="sunna2026")
 
@@ -144,5 +144,5 @@ INSERT OR IGNORE INTO achievements (student_id, date, title, kind) VALUES
 
 -- إعدادات
 INSERT OR IGNORE INTO settings (key, value) VALUES
-  ('center_name', 'مركز السنة لتحفيظ القرآن الكريم'),
+  ('center_name', 'مركز السنة للعلوم الشرعية وتأهيل الدعاة'),
   ('center_sub', 'فرع النسيم — الرياض');

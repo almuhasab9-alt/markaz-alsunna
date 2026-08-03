@@ -45,10 +45,10 @@ function loginView() {
   return `
   <div class="min-h-screen flex items-center justify-center p-4 primary-gradient relative overflow-hidden">
     <div class="absolute inset-0 opacity-10" style="background-image:radial-gradient(circle at 20% 30%, #d4af37 2px, transparent 2px),radial-gradient(circle at 80% 70%, #d4af37 2px, transparent 2px);background-size:60px 60px"></div>
-    <div class="card w-full max-w-md p-8 relative z-10 fade-in" style="border-top:5px solid #d4af37">
+    <div class="card w-full max-w-md p-6 md:p-8 relative z-10 fade-in" style="border-top:5px solid #d4af37">
       <div class="text-center mb-6">
-        <img src="/static/logo.png" alt="شعار مركز السنة" class="mx-auto" style="width:170px">
-        <h1 class="text-2xl font-black text-primary-800 mt-4" id="login-center-name">${esc(state.settings.center_name || 'مركز السنة لتحفيظ القرآن الكريم')}</h1>
+        <img src="/static/logo.png" alt="شعار مركز السنة" class="mx-auto" style="width:150px;max-width:60vw">
+        <h1 class="text-lg md:text-2xl font-black text-primary-800 mt-4" id="login-center-name">${esc(state.settings.center_name || 'مركز السنة للعلوم الشرعية وتأهيل الدعاة')}</h1>
         <p class="text-gold-600 font-bold text-sm mt-1">${esc(state.settings.center_sub || '')}</p>
       </div>
       <form id="login-form" class="space-y-4">
@@ -62,12 +62,12 @@ function loginView() {
         </div>
         <div id="login-error" class="hidden text-red-600 text-sm font-bold bg-red-50 rounded-lg p-2 text-center"></div>
         <button type="submit" class="btn btn-primary w-full text-lg" id="login-btn">
-          <i class="fas fa-sign-in-alt"></i> تسجيل الدخول
+          <i class="fas fa-right-to-bracket"></i> تسجيل الدخول
         </button>
       </form>
       <div class="mt-6 bg-gold-50 border border-gold-200 rounded-xl p-3 text-xs text-gold-800 leading-6">
         <b><i class="fas fa-circle-info ml-1"></i>حسابات تجريبية</b> (غيّر كلمات المرور بعد الدخول):
-        <div class="grid grid-cols-1 gap-1 mt-1 font-mono" dir="ltr" style="text-align:left">
+        <div class="grid grid-cols-1 gap-1 mt-1" dir="ltr" style="text-align:left;font-size:11px">
           <div>admin@test.com / 123456 — مدير</div>
           <div>teacher1@test.com / 123456 — معلم</div>
           <div>parent1@test.com / 123456 — ولي أمر</div>
@@ -96,7 +96,7 @@ function bindLogin() {
       box.textContent = err.message
       box.classList.remove('hidden')
       btn.disabled = false
-      btn.innerHTML = '<i class="fas fa-sign-in-alt"></i> تسجيل الدخول'
+      btn.innerHTML = '<i class="fas fa-right-to-bracket"></i> تسجيل الدخول'
     }
   })
 }
@@ -113,7 +113,7 @@ const NAV_ITEMS = {
   teacher: [
     ['dashboard', 'الرئيسية', 'fa-gauge-high'],
     ['attendance', 'الحضور', 'fa-clipboard-check'],
-    ['memorization', 'الحفظ', 'fa-book-quran'],
+    ['memorization', 'الحفظ', 'fa-book-open-reader'],
     ['students', 'طلابي', 'fa-user-graduate'],
   ],
   parent: [
@@ -129,9 +129,12 @@ function shell(content) {
       <div class="max-w-5xl mx-auto px-4 py-3 flex items-center gap-3">
         <img src="/static/logo.png" alt="الشعار" class="bg-white rounded-lg p-1" style="height:44px;width:auto">
         <div class="flex-1 min-w-0">
-          <div class="font-black text-sm md:text-base truncate">${esc(state.settings.center_name || 'مركز السنة')}</div>
-          <div class="text-gold-300 text-xs">${esc(state.user.name)} — ${{ admin: 'المدير', teacher: 'معلم', parent: 'ولي أمر' }[state.user.role]}</div>
+          <div class="font-black text-xs md:text-base truncate" style="line-height:1.4">${esc(state.settings.center_name || 'مركز السنة')}</div>
+          <div class="text-gold-300 text-xs truncate">${esc(state.user.name)} — ${{ admin: 'المدير', teacher: 'معلم', parent: 'ولي أمر' }[state.user.role]}</div>
         </div>
+        <button id="change-pw-btn" class="btn bg-white/15 hover:bg-white/25 text-white px-3 py-2 text-sm" title="تغيير كلمة المرور">
+          <i class="fas fa-key"></i>
+        </button>
         <button id="logout-btn" class="btn bg-white/15 hover:bg-white/25 text-white px-3 py-2 text-sm" title="تسجيل الخروج">
           <i class="fas fa-right-from-bracket"></i><span class="hidden md:inline">خروج</span>
         </button>
@@ -153,12 +156,46 @@ function shell(content) {
   </div>`
 }
 
+function changePasswordForm() {
+  openModal(`
+    <h3 class="text-lg font-black text-primary-800 mb-4"><i class="fas fa-key text-gold-500 ml-2"></i>تغيير كلمة المرور</h3>
+    <form id="pw-form" class="space-y-3">
+      <div><label class="text-sm font-bold text-primary-800">كلمة المرور الحالية</label><input type="password" id="pw-current" class="input" required autocomplete="current-password"></div>
+      <div><label class="text-sm font-bold text-primary-800">كلمة المرور الجديدة (6 أحرف فأكثر)</label><input type="password" id="pw-new" class="input" required minlength="6" autocomplete="new-password"></div>
+      <div><label class="text-sm font-bold text-primary-800">تأكيد كلمة المرور الجديدة</label><input type="password" id="pw-confirm" class="input" required autocomplete="new-password"></div>
+      <div id="pw-error" class="hidden text-red-600 text-sm font-bold bg-red-50 rounded-lg p-2 text-center"></div>
+      <div class="flex gap-2 pt-1">
+        <button type="submit" class="btn btn-primary flex-1"><i class="fas fa-save"></i> حفظ</button>
+        <button type="button" class="btn btn-outline" onclick="closeModal()">إلغاء</button>
+      </div>
+    </form>`)
+  $('#pw-form').addEventListener('submit', async (e) => {
+    e.preventDefault()
+    const err = $('#pw-error')
+    err.classList.add('hidden')
+    if ($('#pw-new').value !== $('#pw-confirm').value) {
+      err.textContent = 'كلمتا المرور الجديدتان غير متطابقتين'
+      err.classList.remove('hidden')
+      return
+    }
+    try {
+      await api('post', '/api/change-password', { current: $('#pw-current').value, new_password: $('#pw-new').value })
+      closeModal()
+      toast('تم تغيير كلمة المرور بنجاح')
+    } catch (e2) {
+      err.textContent = e2.message
+      err.classList.remove('hidden')
+    }
+  })
+}
+
 function bindShell() {
   $('#logout-btn').addEventListener('click', async () => {
     await api('post', '/api/logout')
     state.user = null
     render()
   })
+  $('#change-pw-btn')?.addEventListener('click', changePasswordForm)
   document.querySelectorAll('[data-nav]').forEach((b) => {
     b.addEventListener('click', () => { state.page = b.dataset.nav; state.pageParams = {}; render() })
   })
@@ -196,7 +233,7 @@ async function adminDashboard() {
       </div>
     </div>
     <div class="card p-4">
-      <h3 class="font-black text-primary-800 mb-3"><i class="fas fa-book-quran text-gold-500 ml-2"></i>إجمالي الحفظ الجديد المسجّل: <span class="text-gold-600">${s.total_parts}</span> جزء تقريباً</h3>
+      <h3 class="font-black text-primary-800 mb-3"><i class="fas fa-book-open-reader text-gold-500 ml-2"></i>إجمالي الحفظ الجديد المسجّل: <span class="text-gold-600">${s.total_parts}</span> جزء تقريباً</h3>
       <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(100, (s.total_parts / 30) * 100)}%"></div></div>
       <div class="text-xs text-slate-500 mt-2">من إجمالي 30 جزءاً — تقييمات آخر 30 يوماً: ${(s.evaluations || []).map(e => `${EVAL_LABELS[e.evaluation] || e.evaluation}: ${e.c}`).join('، ') || 'لا يوجد'}</div>
     </div>
@@ -261,7 +298,7 @@ async function teacherDashboard() {
         <div class="text-xs text-slate-500">حاضر / غائب / متأخر / بإذن</div>
       </button>
       <button data-nav="memorization" class="card p-5 text-right hover:shadow-xl transition">
-        <i class="fas fa-book-quran text-3xl text-gold-500 mb-2"></i>
+        <i class="fas fa-book-open-reader text-3xl text-gold-500 mb-2"></i>
         <div class="font-black text-primary-800">توثيق الحفظ والمراجعة</div>
         <div class="text-xs text-slate-500">التسميع اليومي والتقييم</div>
       </button>
@@ -455,7 +492,7 @@ async function openStudent(id) {
     <div class="flex gap-2 mb-4 flex-wrap">
       ${st.parent_phone ? `<a href="tel:${esc(st.parent_phone)}" class="btn bg-sky-600 text-white px-4 py-2 text-sm flex-1"><i class="fas fa-phone"></i> اتصال</a>` : ''}
       ${st.parent_whatsapp ? `<button onclick="openWhatsApp(${st.id})" class="btn bg-emerald-600 text-white px-4 py-2 text-sm flex-1"><i class="fab fa-whatsapp"></i> واتساب</button>` : ''}
-      ${canEdit ? `<button onclick="closeModal();state.page='memorization';state.pageParams={student_id:${st.id}};render()" class="btn btn-gold px-4 py-2 text-sm flex-1"><i class="fas fa-book-quran"></i> تسجيل حفظ</button>` : ''}
+      ${canEdit ? `<button onclick="closeModal();state.page='memorization';state.pageParams={student_id:${st.id}};render()" class="btn btn-gold px-4 py-2 text-sm flex-1"><i class="fas fa-book-open-reader"></i> تسجيل حفظ</button>` : ''}
       <button onclick="studentReport(${st.id})" class="btn btn-outline px-4 py-2 text-sm flex-1"><i class="fas fa-file-pdf"></i> تقرير PDF</button>
     </div>
     ${(d.achievements || []).length ? `<div class="mb-4">${d.achievements.map((a) => `<span class="badge bg-gold-100 text-gold-700 ml-1 mb-1 inline-block"><i class="fas fa-trophy ml-1"></i>${esc(a.title)} <span class="opacity-60">${a.date}</span></span>`).join('')}</div>` : ''}
@@ -735,7 +772,7 @@ async function memorizationView() {
   const surahOpts = SURAHS.map((s) => `<option value="${s}">${s}</option>`).join('')
   return `
   <div class="fade-in space-y-4">
-    <h2 class="text-xl font-black text-primary-800"><i class="fas fa-book-quran text-gold-500 ml-2"></i>توثيق الحفظ والمراجعة والتقييم</h2>
+    <h2 class="text-xl font-black text-primary-800"><i class="fas fa-book-open-reader text-gold-500 ml-2"></i>توثيق الحفظ والمراجعة والتقييم</h2>
     <div class="card p-4 space-y-3">
       <div>
         <label class="text-sm font-bold text-primary-800">الطالب</label>
@@ -764,6 +801,7 @@ async function memorizationView() {
           <select id="mem-surah-to" class="input">${surahOpts}</select>
         </div>
       </div>
+      <div id="surah-order-error" class="hidden text-red-600 text-xs font-bold bg-red-50 rounded-lg p-2">⚠️ «إلى سورة» يجب أن تكون نفس السورة أو بعدها في ترتيب المصحف</div>
       <div class="grid grid-cols-3 gap-3">
         <div>
           <label class="text-sm font-bold text-primary-800">من آية</label>
@@ -828,9 +866,29 @@ function bindMemorization() {
   }
   $('#mem-student').addEventListener('change', loadRecent)
   loadRecent()
+  // مزامنة «إلى سورة» مع «من سورة» تلقائياً + تحقق من الترتيب
+  const syncSurahs = () => {
+    const fi = $('#mem-surah-from').selectedIndex
+    const ti = $('#mem-surah-to').selectedIndex
+    const errEl = $('#surah-order-error')
+    if (ti < fi) {
+      errEl.classList.remove('hidden')
+      return false
+    }
+    errEl.classList.add('hidden')
+    return true
+  }
+  $('#mem-surah-from').addEventListener('change', () => {
+    if ($('#mem-surah-to').selectedIndex < $('#mem-surah-from').selectedIndex) {
+      $('#mem-surah-to').selectedIndex = $('#mem-surah-from').selectedIndex
+    }
+    syncSurahs()
+  })
+  $('#mem-surah-to').addEventListener('change', syncSurahs)
   $('#save-mem').addEventListener('click', async () => {
     const sid = $('#mem-student').value
     if (!sid) { toast('اختر الطالب', false); return }
+    if (!syncSurahs()) { toast('راجع ترتيب السور: «إلى سورة» قبل «من سورة»', false); return }
     const body = {
       student_id: +sid,
       date: $('#mem-date').value,
@@ -932,7 +990,7 @@ function printReport(title, bodyHtml) {
   <div class="header">
     <img src="/static/logo.png" alt="شعار المركز">
     <div>
-      <div class="name">${esc(state.settings.center_name || 'مركز السنة لتحفيظ القرآن الكريم')}</div>
+      <div class="name">${esc(state.settings.center_name || 'مركز السنة للعلوم الشرعية وتأهيل الدعاة')}</div>
       <div class="sub">${esc(state.settings.center_sub || '')}</div>
       <div class="sub">${title}</div>
     </div>
