@@ -1,0 +1,17 @@
+{
+  "name": "مركز السنة لتحفيظ القرآن الكريم",
+  "short_name": "مركز السنة",
+  "description": "تطبيق إدارة مركز تحفيظ القرآن الكريم — الطلاب، الحلقات، الحضور، الحفظ، التقارير",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a4a3f",
+  "theme_color": "#0d5c4d",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

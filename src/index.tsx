@@ -1,12 +1,517 @@
 import { Hono } from 'hono'
-import { renderer } from './renderer'
+import { cors } from 'hono/cors'
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
+import { serveStatic } from 'hono/cloudflare-workers'
+import { hashPassword, verifyPassword, randomToken, randomSalt } from './auth'
 
-const app = new Hono()
+type Bindings = { DB: D1Database }
 
-app.use(renderer)
+type UserRow = {
+  id: number; name: string; email: string; password_hash: string; salt: string;
+  role: 'admin' | 'teacher' | 'parent'; active: number
+}
 
-app.get('/', (c) => {
-  return c.render(<h1>Hello!</h1>)
+const app = new Hono<{ Bindings: Bindings; Variables: { user: UserRow } }>()
+
+app.use('/api/*', cors())
+
+// ───────── المصادقة ─────────
+async function getSessionUser(c: any): Promise<UserRow | null> {
+  const token = getCookie(c, 'session')
+  if (!token) return null
+  const db: D1Database = c.env.DB
+  const row = await db.prepare(
+    `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.token = ? AND s.expires_at > ? AND u.active = 1`
+  ).bind(token, Date.now()).first<UserRow>()
+  return row || null
+}
+
+const requireAuth = async (c: any, next: any) => {
+  const user = await getSessionUser(c)
+  if (!user) return c.json({ error: 'غير مسجّل الدخول' }, 401)
+  c.set('user', user)
+  await next()
+}
+
+const requireRole = (...roles: string[]) => async (c: any, next: any) => {
+  const user = await getSessionUser(c)
+  if (!user) return c.json({ error: 'غير مسجّل الدخول' }, 401)
+  if (!roles.includes(user.role)) return c.json({ error: 'لا تملك الصلاحية' }, 403)
+  c.set('user', user)
+  await next()
+}
+
+// مساعد: حلقة المعلم الحالي
+async function teacherCircleId(db: D1Database, userId: number): Promise<number | null> {
+  const t = await db.prepare('SELECT id FROM teachers WHERE user_id = ?').bind(userId).first<any>()
+  if (!t) return null
+  const circle = await db.prepare('SELECT id FROM circles WHERE teacher_id = ?').bind(t.id).first<any>()
+  return circle ? circle.id : null
+}
+
+// تسجيل الدخول
+app.post('/api/login', async (c) => {
+  const { email, password } = await c.req.json().catch(() => ({}))
+  if (!email || !password) return c.json({ error: 'أدخل البريد وكلمة المرور' }, 400)
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE email = ? AND active = 1')
+    .bind(String(email).trim().toLowerCase()).first<UserRow>()
+  if (!user || !(await verifyPassword(password, user.salt, user.password_hash))) {
+    return c.json({ error: 'بيانات الدخول غير صحيحة' }, 401)
+  }
+  const token = randomToken()
+  const ttl = 1000 * 60 * 60 * 24 * 14 // 14 يوم
+  await c.env.DB.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)')
+    .bind(token, user.id, Date.now() + ttl).run()
+  setCookie(c, 'session', token, { httpOnly: true, path: '/', maxAge: ttl / 1000, sameSite: 'Lax' })
+  return c.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role } })
+})
+
+app.post('/api/logout', async (c) => {
+  const token = getCookie(c, 'session')
+  if (token) await c.env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run()
+  deleteCookie(c, 'session', { path: '/' })
+  return c.json({ ok: true })
+})
+
+app.get('/api/me', requireAuth, (c) => {
+  const u = c.get('user')
+  return c.json({ user: { id: u.id, name: u.name, email: u.email, role: u.role } })
+})
+
+app.get('/api/settings', requireAuth, async (c) => {
+  const rows = await c.env.DB.prepare('SELECT key, value FROM settings').all<any>()
+  const obj: Record<string, string> = {}
+  for (const r of rows.results) obj[r.key] = r.value
+  return c.json(obj)
+})
+
+app.put('/api/settings', requireRole('admin'), async (c) => {
+  const body = await c.req.json()
+  for (const [k, v] of Object.entries(body)) {
+    await c.env.DB.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+      .bind(k, String(v)).run()
+  }
+  return c.json({ ok: true })
+})
+
+// ───────── لوحة التحكم (إحصائيات لحظية) ─────────
+app.get('/api/stats', requireRole('admin'), async (c) => {
+  const db = c.env.DB
+  const [students, teachers, circles, todayAtt, memStats, last7, perCircle, evalDist] = await db.batch([
+    db.prepare('SELECT COUNT(*) c FROM students WHERE active = 1'),
+    db.prepare('SELECT COUNT(*) c FROM teachers'),
+    db.prepare('SELECT COUNT(*) c FROM circles'),
+    db.prepare(`SELECT status, COUNT(*) c FROM attendance WHERE date = date('now') GROUP BY status`),
+    db.prepare(`SELECT COALESCE(SUM(CASE WHEN type='new' THEN parts_count END),0) parts, COUNT(*) entries FROM memorization`),
+    db.prepare(`SELECT date, SUM(CASE WHEN status='present' THEN 1 ELSE 0 END) present, SUM(CASE WHEN status='absent' THEN 1 ELSE 0 END) absent, SUM(CASE WHEN status='late' THEN 1 ELSE 0 END) late, SUM(CASE WHEN status='excused' THEN 1 ELSE 0 END) excused, COUNT(*) total FROM attendance WHERE date >= date('now','-6 days') GROUP BY date ORDER BY date`),
+    db.prepare(`SELECT c.name, COUNT(s.id) students FROM circles c LEFT JOIN students s ON s.circle_id = c.id AND s.active = 1 GROUP BY c.id ORDER BY c.id`),
+    db.prepare(`SELECT evaluation, COUNT(*) c FROM memorization WHERE evaluation IS NOT NULL AND date >= date('now','-30 days') GROUP BY evaluation`),
+  ])
+  const todayRows = todayAtt.results as any[]
+  const todayTotal = todayRows.reduce((a, r) => a + r.c, 0)
+  const todayPresent = todayRows.filter(r => r.status === 'present' || r.status === 'late').reduce((a, r) => a + r.c, 0)
+  return c.json({
+    students: (students.results[0] as any).c,
+    teachers: (teachers.results[0] as any).c,
+    circles: (circles.results[0] as any).c,
+    today_attendance_rate: todayTotal ? Math.round((todayPresent / todayTotal) * 100) : 0,
+    today: { total: todayTotal, present: todayPresent },
+    total_parts: Math.round(((memStats.results[0] as any).parts as number) * 100) / 100,
+    attendance_7days: last7.results,
+    per_circle: perCircle.results,
+    evaluations: evalDist.results,
+  })
+})
+
+// ───────── الطلاب ─────────
+app.get('/api/students', requireAuth, async (c) => {
+  const u = c.get('user')
+  let sql = `SELECT s.*, c.name circle_name, t.name teacher_name
+    FROM students s LEFT JOIN circles c ON c.id = s.circle_id
+    LEFT JOIN teachers t ON t.id = c.teacher_id WHERE s.active = 1`
+  const params: any[] = []
+  if (u.role === 'teacher') {
+    const cid = await teacherCircleId(c.env.DB, u.id)
+    sql += ' AND s.circle_id = ?'
+    params.push(cid ?? -1)
+  } else if (u.role === 'parent') {
+    sql += ' AND s.parent_user_id = ?'
+    params.push(u.id)
+  }
+  sql += ' ORDER BY s.name'
+  const rows = await c.env.DB.prepare(sql).bind(...params).all<any>()
+  return c.json(rows.results)
+})
+
+app.post('/api/students', requireRole('admin'), async (c) => {
+  const b = await c.req.json()
+  if (!b.name) return c.json({ error: 'الاسم مطلوب' }, 400)
+  const r = await c.env.DB.prepare(
+    `INSERT INTO students (name, age, parent_phone, parent_whatsapp, circle_id, notes) VALUES (?,?,?,?,?,?)`
+  ).bind(b.name, b.age ?? null, b.parent_phone ?? null, b.parent_whatsapp ?? null, b.circle_id ?? null, b.notes ?? null).run()
+  return c.json({ id: r.meta.last_row_id })
+})
+
+app.put('/api/students/:id', requireRole('admin'), async (c) => {
+  const b = await c.req.json()
+  await c.env.DB.prepare(
+    `UPDATE students SET name=?, age=?, parent_phone=?, parent_whatsapp=?, circle_id=?, notes=? WHERE id=?`
+  ).bind(b.name, b.age ?? null, b.parent_phone ?? null, b.parent_whatsapp ?? null, b.circle_id ?? null, b.notes ?? null, c.req.param('id')).run()
+  return c.json({ ok: true })
+})
+
+app.delete('/api/students/:id', requireRole('admin'), async (c) => {
+  await c.env.DB.prepare('UPDATE students SET active = 0 WHERE id = ?').bind(c.req.param('id')).run()
+  return c.json({ ok: true })
+})
+
+// ملف الطالب الكامل
+app.get('/api/students/:id', requireAuth, async (c) => {
+  const id = c.req.param('id')
+  const s = await c.env.DB.prepare(
+    `SELECT s.*, c.name circle_name, t.name teacher_name FROM students s
+     LEFT JOIN circles c ON c.id = s.circle_id LEFT JOIN teachers t ON t.id = c.teacher_id WHERE s.id = ?`
+  ).bind(id).first<any>()
+  if (!s) return c.json({ error: 'غير موجود' }, 404)
+  const u = c.get('user')
+  if (u.role === 'parent' && s.parent_user_id !== u.id) return c.json({ error: 'لا تملك الصلاحية' }, 403)
+  if (u.role === 'teacher') {
+    const cid = await teacherCircleId(c.env.DB, u.id)
+    if (s.circle_id !== cid) return c.json({ error: 'لا تملك الصلاحية' }, 403)
+  }
+  const [attendance, memorization, achievements, attSummary, parts] = await c.env.DB.batch([
+    c.env.DB.prepare('SELECT * FROM attendance WHERE student_id = ? ORDER BY date DESC LIMIT 60').bind(id),
+    c.env.DB.prepare('SELECT * FROM memorization WHERE student_id = ? ORDER BY date DESC, id DESC LIMIT 60').bind(id),
+    c.env.DB.prepare('SELECT * FROM achievements WHERE student_id = ? ORDER BY date DESC').bind(id),
+    c.env.DB.prepare(`SELECT status, COUNT(*) c FROM attendance WHERE student_id = ? GROUP BY status`).bind(id),
+    c.env.DB.prepare(`SELECT COALESCE(SUM(CASE WHEN type='new' THEN parts_count END),0) total FROM memorization WHERE student_id = ?`).bind(id),
+  ])
+  return c.json({
+    student: s,
+    attendance: attendance.results,
+    memorization: memorization.results,
+    achievements: achievements.results,
+    attendance_summary: attSummary.results,
+    total_parts: (parts.results[0] as any).total,
+  })
+})
+
+// ───────── المعلمون ─────────
+app.get('/api/teachers', requireRole('admin'), async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT t.*, u.email, COUNT(s.id) students_count, c.name circle_name
+     FROM teachers t LEFT JOIN users u ON u.id = t.user_id
+     LEFT JOIN circles c ON c.teacher_id = t.id
+     LEFT JOIN students s ON s.circle_id = c.id AND s.active = 1
+     GROUP BY t.id ORDER BY t.name`
+  ).all<any>()
+  return c.json(rows.results)
+})
+
+app.post('/api/teachers', requireRole('admin'), async (c) => {
+  const b = await c.req.json()
+  if (!b.name || !b.email || !b.password) return c.json({ error: 'الاسم والبريد وكلمة المرور مطلوبة' }, 400)
+  const email = String(b.email).trim().toLowerCase()
+  const exists = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first()
+  if (exists) return c.json({ error: 'البريد مسجّل مسبقاً' }, 400)
+  const salt = randomSalt()
+  const hash = await hashPassword(b.password, salt)
+  const ur = await c.env.DB.prepare('INSERT INTO users (name, email, password_hash, salt, role) VALUES (?,?,?,?,?)')
+    .bind(b.name, email, hash, salt, 'teacher').run()
+  const tr = await c.env.DB.prepare('INSERT INTO teachers (user_id, name, phone) VALUES (?,?,?)')
+    .bind(ur.meta.last_row_id, b.name, b.phone ?? null).run()
+  return c.json({ id: tr.meta.last_row_id, user_id: ur.meta.last_row_id })
+})
+
+app.put('/api/teachers/:id', requireRole('admin'), async (c) => {
+  const b = await c.req.json()
+  await c.env.DB.prepare('UPDATE teachers SET name = ?, phone = ? WHERE id = ?')
+    .bind(b.name, b.phone ?? null, c.req.param('id')).run()
+  if (b.password) {
+    const t = await c.env.DB.prepare('SELECT user_id FROM teachers WHERE id = ?').bind(c.req.param('id')).first<any>()
+    if (t?.user_id) {
+      const salt = randomSalt()
+      const hash = await hashPassword(b.password, salt)
+      await c.env.DB.prepare('UPDATE users SET password_hash = ?, salt = ?, name = ? WHERE id = ?')
+        .bind(hash, salt, b.name, t.user_id).run()
+    }
+  }
+  return c.json({ ok: true })
+})
+
+app.delete('/api/teachers/:id', requireRole('admin'), async (c) => {
+  const id = c.req.param('id')
+  const t = await c.env.DB.prepare('SELECT user_id FROM teachers WHERE id = ?').bind(id).first<any>()
+  await c.env.DB.prepare('UPDATE circles SET teacher_id = NULL WHERE teacher_id = ?').bind(id).run()
+  await c.env.DB.prepare('DELETE FROM teachers WHERE id = ?').bind(id).run()
+  if (t?.user_id) await c.env.DB.prepare('UPDATE users SET active = 0 WHERE id = ?').bind(t.user_id).run()
+  return c.json({ ok: true })
+})
+
+// ───────── أولياء الأمور (إنشاء حساب وربطه بطالب) ─────────
+app.post('/api/parents', requireRole('admin'), async (c) => {
+  const b = await c.req.json()
+  if (!b.name || !b.email || !b.password || !b.student_id) return c.json({ error: 'كل الحقول مطلوبة' }, 400)
+  const email = String(b.email).trim().toLowerCase()
+  const exists = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first()
+  if (exists) return c.json({ error: 'البريد مسجّل مسبقاً' }, 400)
+  const salt = randomSalt()
+  const hash = await hashPassword(b.password, salt)
+  const ur = await c.env.DB.prepare('INSERT INTO users (name, email, password_hash, salt, role) VALUES (?,?,?,?,?)')
+    .bind(b.name, email, hash, salt, 'parent').run()
+  await c.env.DB.prepare('UPDATE students SET parent_user_id = ? WHERE id = ?')
+    .bind(ur.meta.last_row_id, b.student_id).run()
+  return c.json({ id: ur.meta.last_row_id })
+})
+
+// ───────── الحلقات ─────────
+app.get('/api/circles', requireAuth, async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT c.*, t.name teacher_name, COUNT(s.id) students_count
+     FROM circles c LEFT JOIN teachers t ON t.id = c.teacher_id
+     LEFT JOIN students s ON s.circle_id = c.id AND s.active = 1
+     GROUP BY c.id ORDER BY c.id`
+  ).all<any>()
+  return c.json(rows.results)
+})
+
+app.post('/api/circles', requireRole('admin'), async (c) => {
+  const b = await c.req.json()
+  if (!b.name) return c.json({ error: 'اسم الحلقة مطلوب' }, 400)
+  const r = await c.env.DB.prepare('INSERT INTO circles (name, teacher_id, time, days) VALUES (?,?,?,?)')
+    .bind(b.name, b.teacher_id ?? null, b.time ?? null, b.days ?? null).run()
+  return c.json({ id: r.meta.last_row_id })
+})
+
+app.put('/api/circles/:id', requireRole('admin'), async (c) => {
+  const b = await c.req.json()
+  await c.env.DB.prepare('UPDATE circles SET name=?, teacher_id=?, time=?, days=? WHERE id=?')
+    .bind(b.name, b.teacher_id ?? null, b.time ?? null, b.days ?? null, c.req.param('id')).run()
+  return c.json({ ok: true })
+})
+
+app.delete('/api/circles/:id', requireRole('admin'), async (c) => {
+  await c.env.DB.prepare('UPDATE students SET circle_id = NULL WHERE circle_id = ?').bind(c.req.param('id')).run()
+  await c.env.DB.prepare('DELETE FROM circles WHERE id = ?').bind(c.req.param('id')).run()
+  return c.json({ ok: true })
+})
+
+// ───────── الحضور ─────────
+// جلب حضور يوم معيّن (المعلم: حلقته فقط)
+app.get('/api/attendance', requireAuth, async (c) => {
+  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
+  const u = c.get('user')
+  let circleId = c.req.query('circle_id')
+  if (u.role === 'teacher') {
+    const cid = await teacherCircleId(c.env.DB, u.id)
+    circleId = String(cid ?? -1)
+  }
+  let sql = `SELECT s.id student_id, s.name, s.circle_id, a.status, a.note
+    FROM students s LEFT JOIN attendance a ON a.student_id = s.id AND a.date = ?
+    WHERE s.active = 1`
+  const params: any[] = [date]
+  if (circleId) { sql += ' AND s.circle_id = ?'; params.push(circleId) }
+  sql += ' ORDER BY s.name'
+  const rows = await c.env.DB.prepare(sql).bind(...params).all<any>()
+  return c.json({ date, rows: rows.results })
+})
+
+// حفظ حضور جماعي ليوم واحد
+app.post('/api/attendance', requireRole('admin', 'teacher'), async (c) => {
+  const b = await c.req.json()
+  const date = b.date || new Date().toISOString().slice(0, 10)
+  const items: any[] = b.items || []
+  const u = c.get('user')
+  if (!items.length) return c.json({ error: 'لا توجد بيانات' }, 400)
+  const stmts = items
+    .filter((i) => ['present', 'absent', 'late', 'excused'].includes(i.status))
+    .map((i) => c.env.DB.prepare(
+      `INSERT INTO attendance (student_id, date, status, note, created_by) VALUES (?,?,?,?,?)
+       ON CONFLICT(student_id, date) DO UPDATE SET status=excluded.status, note=excluded.note`
+    ).bind(i.student_id, date, i.status, i.note ?? null, u.id))
+  await c.env.DB.batch(stmts)
+  return c.json({ ok: true, count: stmts.length })
+})
+
+// ───────── الحفظ والمراجعة ─────────
+app.get('/api/memorization', requireAuth, async (c) => {
+  const u = c.get('user')
+  const date = c.req.query('date')
+  let circleId = c.req.query('circle_id')
+  if (u.role === 'teacher') {
+    const cid = await teacherCircleId(c.env.DB, u.id)
+    circleId = String(cid ?? -1)
+  }
+  let sql = `SELECT m.*, s.name student_name FROM memorization m JOIN students s ON s.id = m.student_id WHERE 1=1`
+  const params: any[] = []
+  if (date) { sql += ' AND m.date = ?'; params.push(date) }
+  if (circleId) { sql += ' AND s.circle_id = ?'; params.push(circleId) }
+  if (u.role === 'parent') { sql += ' AND s.parent_user_id = ?'; params.push(u.id) }
+  sql += ' ORDER BY m.date DESC, m.id DESC LIMIT 200'
+  const rows = await c.env.DB.prepare(sql).bind(...params).all<any>()
+  return c.json(rows.results)
+})
+
+app.post('/api/memorization', requireRole('admin', 'teacher'), async (c) => {
+  const b = await c.req.json()
+  if (!b.student_id) return c.json({ error: 'الطالب مطلوب' }, 400)
+  const u = c.get('user')
+  const date = b.date || new Date().toISOString().slice(0, 10)
+  const r = await c.env.DB.prepare(
+    `INSERT INTO memorization (student_id, date, type, surah_from, ayah_from, surah_to, ayah_to, parts_count, evaluation, notes, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(b.student_id, date, b.type === 'review' ? 'review' : 'new',
+    b.surah_from ?? null, b.ayah_from ?? null, b.surah_to ?? null, b.ayah_to ?? null,
+    b.parts_count ?? 0, b.evaluation ?? null, b.notes ?? null, u.id).run()
+  // إنجاز: إتمام سورة
+  if (b.completed_surah) {
+    await c.env.DB.prepare('INSERT INTO achievements (student_id, date, title, kind) VALUES (?,?,?,?)')
+      .bind(b.student_id, date, `أتم سورة ${b.completed_surah}`, 'surah').run()
+  }
+  return c.json({ id: r.meta.last_row_id })
+})
+
+app.delete('/api/memorization/:id', requireRole('admin', 'teacher'), async (c) => {
+  await c.env.DB.prepare('DELETE FROM memorization WHERE id = ?').bind(c.req.param('id')).run()
+  return c.json({ ok: true })
+})
+
+// ───────── التقارير ─────────
+app.get('/api/reports/center', requireRole('admin'), async (c) => {
+  const from = c.req.query('from') || new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10)
+  const to = c.req.query('to') || new Date().toISOString().slice(0, 10)
+  const [att, mem, circles] = await c.env.DB.batch([
+    c.env.DB.prepare(`SELECT date, status, COUNT(*) c FROM attendance WHERE date BETWEEN ? AND ? GROUP BY date, status ORDER BY date`).bind(from, to),
+    c.env.DB.prepare(`SELECT m.date, s.name student_name, m.type, m.surah_from, m.surah_to, m.evaluation, m.parts_count FROM memorization m JOIN students s ON s.id = m.student_id WHERE m.date BETWEEN ? AND ? ORDER BY m.date DESC LIMIT 300`).bind(from, to),
+    c.env.DB.prepare(`SELECT c.name, COUNT(DISTINCT s.id) students,
+        SUM(CASE WHEN a.status='present' THEN 1 ELSE 0 END) present,
+        SUM(CASE WHEN a.status='absent' THEN 1 ELSE 0 END) absent
+      FROM circles c LEFT JOIN students s ON s.circle_id = c.id AND s.active = 1
+      LEFT JOIN attendance a ON a.student_id = s.id AND a.date BETWEEN ? AND ?
+      GROUP BY c.id`).bind(from, to),
+  ])
+  return c.json({ from, to, attendance: att.results, memorization: mem.results, circles: circles.results })
+})
+
+app.get('/api/reports/student/:id', requireAuth, async (c) => {
+  const id = c.req.param('id')
+  const from = c.req.query('from') || new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10)
+  const to = c.req.query('to') || new Date().toISOString().slice(0, 10)
+  const s = await c.env.DB.prepare(
+    `SELECT s.*, c.name circle_name, t.name teacher_name FROM students s
+     LEFT JOIN circles c ON c.id = s.circle_id LEFT JOIN teachers t ON t.id = c.teacher_id WHERE s.id = ?`
+  ).bind(id).first<any>()
+  if (!s) return c.json({ error: 'غير موجود' }, 404)
+  const u = c.get('user')
+  if (u.role === 'parent' && s.parent_user_id !== u.id) return c.json({ error: 'لا تملك الصلاحية' }, 403)
+  const [att, attSum, mem, ach] = await c.env.DB.batch([
+    c.env.DB.prepare('SELECT * FROM attendance WHERE student_id = ? AND date BETWEEN ? AND ? ORDER BY date').bind(id, from, to),
+    c.env.DB.prepare('SELECT status, COUNT(*) c FROM attendance WHERE student_id = ? AND date BETWEEN ? AND ? GROUP BY status').bind(id, from, to),
+    c.env.DB.prepare('SELECT * FROM memorization WHERE student_id = ? AND date BETWEEN ? AND ? ORDER BY date DESC').bind(id, from, to),
+    c.env.DB.prepare('SELECT * FROM achievements WHERE student_id = ? ORDER BY date DESC').bind(id),
+  ])
+  return c.json({ from, to, student: s, attendance: att.results, attendance_summary: attSum.results, memorization: mem.results, achievements: ach.results })
+})
+
+app.get('/api/reports/circle/:id', requireRole('admin'), async (c) => {
+  const id = c.req.param('id')
+  const from = c.req.query('from') || new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10)
+  const to = c.req.query('to') || new Date().toISOString().slice(0, 10)
+  const circle = await c.env.DB.prepare(
+    'SELECT c.*, t.name teacher_name FROM circles c LEFT JOIN teachers t ON t.id = c.teacher_id WHERE c.id = ?'
+  ).bind(id).first<any>()
+  if (!circle) return c.json({ error: 'غير موجودة' }, 404)
+  const students = await c.env.DB.prepare(
+    `SELECT s.id, s.name,
+      SUM(CASE WHEN a.status='present' THEN 1 ELSE 0 END) present,
+      SUM(CASE WHEN a.status='absent' THEN 1 ELSE 0 END) absent,
+      SUM(CASE WHEN a.status='late' THEN 1 ELSE 0 END) late,
+      SUM(CASE WHEN a.status='excused' THEN 1 ELSE 0 END) excused,
+      (SELECT COALESCE(SUM(parts_count),0) FROM memorization m WHERE m.student_id = s.id AND m.type='new' AND m.date BETWEEN ? AND ?) parts
+     FROM students s LEFT JOIN attendance a ON a.student_id = s.id AND a.date BETWEEN ? AND ?
+     WHERE s.circle_id = ? AND s.active = 1 GROUP BY s.id ORDER BY s.name`
+  ).bind(from, to, from, to, id).all<any>()
+  return c.json({ from, to, circle, students: students.results })
+})
+
+// ───────── الملفات الثابتة ─────────
+app.use('/static/*', serveStatic({ root: './public' }))
+app.use('/manifest.webmanifest', serveStatic({ path: './public/manifest.webmanifest' }))
+app.use('/sw.js', serveStatic({ path: './public/sw.js' }))
+app.use('/favicon.ico', serveStatic({ path: './public/static/icon-192.png' }))
+
+// الصفحة الرئيسية (SPA)
+app.get('*', (c) => {
+  return c.html(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0d5c4d">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>مركز السنة لتحفيظ القرآن الكريم</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" href="/static/icon-192.png">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: {
+      primary: {50:'#eef7f5',100:'#d7ece8',200:'#b0d9d1',300:'#7fc0b4',400:'#4ba392',500:'#0f766e',600:'#0d5c4d',700:'#0a4a3f',800:'#083a32',900:'#062c26'},
+      gold: {50:'#fbf8ec',100:'#f5edc8',200:'#ecdb8f',300:'#e0c55a',400:'#d4af37',500:'#b8942a',600:'#96761f',700:'#775d1b',800:'#644d1d',900:'#55411c'}
+    }, fontFamily: { cairo: ['Cairo','sans-serif'], amiri: ['Amiri','serif'] } } } }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;600;700;900&family=Amiri:wght@400;700&display=swap" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+  <style>
+    * { font-family: 'Cairo', sans-serif; -webkit-tap-highlight-color: transparent; }
+    body { background: #f4f7f6; }
+    .islamic-pattern { background-image: radial-gradient(circle at 50% 50%, rgba(13,92,77,.06) 1px, transparent 1px); background-size: 22px 22px; }
+    .gold-gradient { background: linear-gradient(135deg, #d4af37, #b8942a); }
+    .primary-gradient { background: linear-gradient(135deg, #0f766e, #0a4a3f); }
+    .card { background: white; border-radius: 1rem; box-shadow: 0 2px 12px rgba(13,92,77,.08); border: 1px solid #e5efed; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; border-radius: .75rem; font-weight: 700; transition: all .2s; cursor: pointer; border: none; }
+    .btn:active { transform: scale(.96); }
+    .btn-primary { background: linear-gradient(135deg, #0f766e, #0a4a3f); color: white; padding: .65rem 1.25rem; box-shadow: 0 4px 12px rgba(13,92,77,.25); }
+    .btn-gold { background: linear-gradient(135deg, #d4af37, #b8942a); color: white; padding: .65rem 1.25rem; box-shadow: 0 4px 12px rgba(212,175,55,.3); }
+    .btn-outline { border: 2px solid #0f766e; color: #0f766e; padding: .6rem 1.1rem; background: white; }
+    .input { width: 100%; border: 2px solid #dbe8e5; border-radius: .75rem; padding: .65rem .9rem; outline: none; transition: border .2s; background: white; }
+    .input:focus { border-color: #0f766e; }
+    .badge { padding: .2rem .65rem; border-radius: 999px; font-size: .75rem; font-weight: 700; }
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(6,44,38,.5); backdrop-filter: blur(3px); z-index: 60; display: flex; align-items: center; justify-content: center; padding: 1rem; }
+    .fade-in { animation: fadeIn .25s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+    #splash { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; background: linear-gradient(160deg, #0f766e 0%, #0a4a3f 60%, #062c26 100%); transition: opacity .6s; }
+    .splash-logo { animation: splashPulse 1.6s ease-in-out infinite; }
+    @keyframes splashPulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.05); } }
+    .progress-bar { height: .6rem; border-radius: 999px; background: #e2e8f0; overflow: hidden; }
+    .progress-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #d4af37, #0f766e); transition: width .6s; }
+    .att-btn { flex: 1; padding: .5rem .2rem; border-radius: .6rem; font-size: .72rem; font-weight: 700; border: 2px solid transparent; cursor: pointer; transition: all .15s; background: #f1f5f4; color: #64748b; }
+    .att-btn.active-present { background: #d1fae5; color: #047857; border-color: #10b981; }
+    .att-btn.active-absent { background: #fee2e2; color: #b91c1c; border-color: #ef4444; }
+    .att-btn.active-late { background: #fef3c7; color: #b45309; border-color: #f59e0b; }
+    .att-btn.active-excused { background: #e0e7ff; color: #4338ca; border-color: #818cf8; }
+    .nav-item { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: .65rem; color: #94a3b8; padding: .4rem .6rem; border-radius: .75rem; transition: all .2s; cursor: pointer; }
+    .nav-item.active { color: #0d5c4d; background: #d7ece8; }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background: #b0d9d1; border-radius: 999px; }
+    @media print { .no-print { display: none !important; } }
+  </style>
+</head>
+<body class="islamic-pattern">
+  <div id="splash">
+    <img src="/static/logo.png" alt="مركز السنة" class="splash-logo" style="width:220px;max-width:70vw;background:white;border-radius:1.5rem;padding:1rem;box-shadow:0 20px 60px rgba(0,0,0,.35)">
+    <div class="text-white mt-6 font-black text-xl">مركز السنة لتحفيظ القرآن الكريم</div>
+    <div class="text-gold-300 mt-2 text-sm tracking-widest">﴿ خَيْرُكُمْ مَنْ تَعَلَّمَ الْقُرْآنَ وَعَلَّمَهُ ﴾</div>
+  </div>
+  <div id="app"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>`)
 })
 
 export default app
