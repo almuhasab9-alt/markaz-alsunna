@@ -145,4 +145,4 @@ INSERT OR IGNORE INTO achievements (student_id, date, title, kind) VALUES
 -- إعدادات
 INSERT OR IGNORE INTO settings (key, value) VALUES
   ('center_name', 'مركز السنة للعلوم الشرعية وتأهيل الدعاة'),
-  ('center_sub', 'فرع النسيم — الرياض');
+  ('center_sub', 'شبوة - عتق');
