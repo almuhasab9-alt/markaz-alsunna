@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   diagnose:
@@ -18,65 +18,78 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Curl basic check
-        if: always()
+      - name: Run diagnosis
         run: |
           set +e
-          echo "=== HTTP status ==="
-          CODE=$(curl -s -o /tmp/body.html -w "%{http_code}" --max-time 30 https://markaz-alsunna.pages.dev)
-          echo "HTTP status: $CODE"
-          echo "::notice::HTTP status: $CODE"
-          echo "=== Response headers ==="
-          curl -sI --max-time 30 https://markaz-alsunna.pages.dev 2>&1 | head -30
-          echo "=== Body (first 1000 chars) ==="
-          head -c 1000 /tmp/body.html
-          echo ""
-          echo "=== Body size ==="
-          wc -c /tmp/body.html
-          exit 0
-
-      - name: Check DNS and redirects
-        if: always()
-        run: |
-          set +e
-          echo "=== DNS resolution ==="
-          dig markaz-alsunna.pages.dev +short 2>/dev/null || nslookup markaz-alsunna.pages.dev 2>&1
-          echo "=== HTTPS follow redirects ==="
-          curl -sIL --max-time 30 https://markaz-alsunna.pages.dev 2>&1 | head -40
-          exit 0
-
-      - name: Check API routes
-        if: always()
-        run: |
-          set +e
-          echo "=== /api/health ==="
-          curl -s -w "\nHTTP=%{http_code}\n" --max-time 15 https://markaz-alsunna.pages.dev/api/health 2>&1 | head -10
-          echo "=== /api/login ==="
-          curl -s -w "\nHTTP=%{http_code}\n" --max-time 15 https://markaz-alsunna.pages.dev/api/login 2>&1 | head -10
-          echo "=== / (root) ==="
-          curl -s -w "\nHTTP=%{http_code}\n" --max-time 15 https://markaz-alsunna.pages.dev/ 2>&1 | head -10
-          exit 0
-
-      - name: List Cloudflare Pages projects
-        if: always()
-        run: |
-          set +e
+          {
+            echo "# Deployment Diagnosis Report"
+            echo "Date: $(date -u)"
+            echo ""
+            echo "## HTTP Status Check"
+            CODE=$(curl -s -o /tmp/body.html -w "%{http_code}" --max-time 30 https://markaz-alsunna.pages.dev)
+            echo "HTTP status: $CODE"
+            echo ""
+            echo "## Response Headers"
+            curl -sI --max-time 30 https://markaz-alsunna.pages.dev 2>&1
+            echo ""
+            echo "## Body (first 2000 chars)"
+            head -c 2000 /tmp/body.html
+            echo ""
+            echo "## Body size"
+            wc -c /tmp/body.html
+            echo ""
+            echo "## DNS Resolution"
+            dig markaz-alsunna.pages.dev +short 2>/dev/null || nslookup markaz-alsunna.pages.dev 2>&1
+            echo ""
+            echo "## HTTPS Follow Redirects"
+            curl -sIL --max-time 30 https://markaz-alsunna.pages.dev 2>&1 | head -40
+            echo ""
+            echo "## API Routes"
+            echo "### /api/health"
+            curl -s -w "\nHTTP=%{http_code}\n" --max-time 15 https://markaz-alsunna.pages.dev/api/health 2>&1 | head -10
+            echo "### /api/login"
+            curl -s -w "\nHTTP=%{http_code}\n" --max-time 15 https://markaz-alsunna.pages.dev/api/login 2>&1 | head -10
+            echo "### / (root)"
+            curl -s -w "\nHTTP=%{http_code}\n" --max-time 15 https://markaz-alsunna.pages.dev/ 2>&1 | head -10
+            echo ""
+          } > diagnosis-report.md 2>&1
+          
+          # Cloudflare checks
           echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> $GITHUB_ENV
           echo "CLOUDFLARE_ACCOUNT_ID=${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" >> $GITHUB_ENV
-          echo "=== Pages projects ==="
-          npx wrangler pages project list 2>&1 | head -20
-          echo "=== D1 databases ==="
-          npx wrangler d1 list 2>&1 | head -20
-          echo "=== D1 tables ==="
-          npx wrangler d1 execute webapp-production --remote --command "SELECT name FROM sqlite_master WHERE type='table'" 2>&1 | head -30
-          echo "=== Pages deployments ==="
-          npx wrangler pages deployment list --project-name=markaz-alsunna 2>&1 | head -20
+          
+          {
+            echo ""
+            echo "## Cloudflare Pages Projects"
+            npx wrangler pages project list 2>&1 | head -20
+            echo ""
+            echo "## D1 Databases"
+            npx wrangler d1 list 2>&1 | head -20
+            echo ""
+            echo "## D1 Tables"
+            npx wrangler d1 execute webapp-production --remote --command "SELECT name FROM sqlite_master WHERE type='table'" 2>&1 | head -30
+            echo ""
+            echo "## Pages Deployments"
+            npx wrangler pages deployment list --project-name=markaz-alsunna 2>&1 | head -20
+            echo ""
+            echo "## Pages deployment details"
+            npx wrangler pages deployment list --project-name=markaz-alsunna 2>&1
+          } >> diagnosis-report.md 2>&1
+          
+          cat diagnosis-report.md
           exit 0
+
+      - name: Commit diagnosis report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add diagnosis-report.md
+          git commit -m "chore: add deployment diagnosis report"
+          git push
 
       - name: Upload diagnosis
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: diagnosis
-          path: |
-            /tmp/body.html
+          path: diagnosis-report.md
