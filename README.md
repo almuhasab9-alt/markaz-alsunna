@@ -31,8 +31,9 @@
 ## البنية التقنية
 - **Backend**: Hono + TypeScript على Cloudflare Pages (Workers)
 - **قاعدة البيانات**: Cloudflare D1 (SQLite سحابية مركزية — مزامنة لحظية)
-- **Frontend**: SPA بجافاسكربت + Tailwind CSS + Chart.js + خطوط Cairo/Amiri
-- **المصادقة**: PBKDF2-SHA256 عبر Web Crypto API + جلسات HttpOnly cookies
+- **Frontend**: SPA بجافاسكربت + Tailwind CSS **مبني محلياً** (`npm run tailwind:css` — لا CDN) + Chart.js + خطوط Cairo/Amiri
+- **المصادقة**: PBKDF2-SHA256 عبر Web Crypto API (مقارنة زمنية-ثابتة) + جلسات HttpOnly cookies
+- **التوقيت**: كل التواريخ بتوقيت `Asia/Aden` (UTC+3) — ثابت `TZ` في `src/index.tsx` و`public/static/app.js`
 
 ## بنية البيانات (D1)
 - `users` — المستخدمون (admin/teacher/parent)
@@ -66,6 +67,7 @@
 
 ## التشغيل محلياً
 ```bash
+npm install
 npm run build
 npm run db:reset          # أول مرة: مخطط + بيانات تجريبية
 pm2 start ecosystem.config.cjs
@@ -78,8 +80,7 @@ curl http://localhost:3000
 
 ## خطوات تطوير مقترحة لاحقاً
 - واجهة رسومية لإنشاء حسابات أولياء الأمور من لوحة المدير
-- تغيير كلمة المرور من داخل التطبيق
 - إشعارات غياب تلقائية عبر WhatsApp Cloud API
 - شاشة إعدادات للمدير (اسم المركز، رفع الشعار)
 
-**آخر تحديث**: 2026-08-03
+**آخر تحديث**: 2026-08-24 — إصلاح ثغرة صلاحيات (معلم بلا حلقة/طالب بلا حلقة)، توحيد التوقيت المحلي UTC+3، بناء Tailwind محلياً بدل CDN، مقارنة كلمات مرور زمنية-ثابتة، تنظيف الجلسات المنتهية، وتخزين موارد CDN في Service Worker للعمل دون إنترنت. دليل النشر: `DEPLOY.md`

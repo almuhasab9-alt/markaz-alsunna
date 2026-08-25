@@ -19,7 +19,11 @@ const EVAL_COLORS = { excellent: 'bg-emerald-100 text-emerald-700', very_good: '
 
 const $ = (sel) => document.querySelector(sel)
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
-const today = () => new Date().toISOString().slice(0, 10)
+// التوقيت المحلي (اليمن/السعودية UTC+3) — toISOString كان يرجع UTC فيؤرّخ ما بعد 9 مساءً باليوم التالي
+const TZ = 'Asia/Aden'
+const localDate = (d = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d)
+const today = () => localDate()
+const daysAgo = (n) => localDate(new Date(Date.now() - n * 864e5))
 
 async function api(method, url, data) {
   try {
@@ -524,7 +528,7 @@ async function openWhatsApp(id) {
   const wa = (st.parent_whatsapp || '').replace(/[^0-9]/g, '')
   if (!wa) { toast('لا يوجد رقم واتساب لولي الأمر', false); return }
   const sum = Object.fromEntries((d.attendance_summary || []).map((r) => [r.status, r.c]))
-  const weekMem = (d.memorization || []).filter((m) => m.date >= new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10))
+  const weekMem = (d.memorization || []).filter((m) => m.date >= daysAgo(7))
   const weekNew = weekMem.filter((m) => m.type === 'new').map((m) => `${m.surah_from}${m.ayah_from ? ` (${m.ayah_from}${m.ayah_to ? '–' + m.ayah_to : ''})` : ''}`).join('، ') || '—'
   const lastEval = (d.memorization || []).find((m) => m.evaluation)
   const lastAch = (d.achievements || [])[0]
@@ -920,7 +924,7 @@ async function deleteMem(id) {
 // ───────── التقارير ─────────
 async function reportsView() {
   const [students, circles] = await Promise.all([api('get', '/api/students'), api('get', '/api/circles')])
-  const from = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10)
+  const from = daysAgo(30)
   return `
   <div class="fade-in space-y-4">
     <h2 class="text-xl font-black text-primary-800"><i class="fas fa-file-lines text-gold-500 ml-2"></i>التقارير والإحصائيات</h2>
@@ -957,7 +961,7 @@ async function reportsView() {
 }
 
 function quickRange(days) {
-  $('#rep-from').value = new Date(Date.now() - days * 864e5).toISOString().slice(0, 10)
+  $('#rep-from').value = daysAgo(days)
   $('#rep-to').value = today()
 }
 

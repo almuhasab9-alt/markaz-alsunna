@@ -1,5 +1,4 @@
 import { Hono } from 'hono'
-import { cors } from 'hono/cors'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { serveStatic } from 'hono/cloudflare-workers'
 import { hashPassword, verifyPassword, randomToken, randomSalt } from './auth'
@@ -12,8 +11,6 @@ type UserRow = {
 }
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: UserRow } }>()
-
-app.use('/api/*', cors())
 
 // ───────── ترويسات الأمان ─────────
 app.use('*', async (c, next) => {
@@ -54,6 +51,14 @@ const clampNum = (v: any, min: number, max: number): number | null => {
   const n = Number(v)
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : null
 }
+
+// ───────── التوقيت المحلي ─────────
+// toISOString() و date('now') يرجعان UTC — أي تسجيل بعد 9 مساءً (+3) كان يؤرَّخ باليوم التالي خطأً
+const TZ = 'Asia/Aden' // اليمن/السعودية UTC+3 بلا توقيت صيفي — غيّرها هنا إن لزم
+const localDate = (d: Date = new Date()): string =>
+  new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d)
+const todayStr = () => localDate()
+const daysAgoStr = (n: number) => localDate(new Date(Date.now() - n * 864e5))
 
 // ───────── المصادقة ─────────
 async function getSessionUser(c: any): Promise<UserRow | null> {
@@ -116,8 +121,12 @@ app.post('/api/login', async (c) => {
   }
   const token = randomToken()
   const ttl = 1000 * 60 * 60 * 24 * 14 // 14 يوم
-  await c.env.DB.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)')
-    .bind(token, user.id, Date.now() + ttl).run()
+  // تنظيف الجلسات المنتهية (كانت تتراكم في الجدول بلا حذف)
+  await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(Date.now()),
+    c.env.DB.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)')
+      .bind(token, user.id, Date.now() + ttl),
+  ])
   setCookie(c, 'session', token, {
     httpOnly: true, path: '/', maxAge: ttl / 1000, sameSite: 'Lax',
     secure: c.req.url.startsWith('https'),
@@ -177,11 +186,11 @@ app.get('/api/stats', requireRole('admin'), async (c) => {
     db.prepare('SELECT COUNT(*) c FROM students WHERE active = 1'),
     db.prepare('SELECT COUNT(*) c FROM teachers'),
     db.prepare('SELECT COUNT(*) c FROM circles'),
-    db.prepare(`SELECT status, COUNT(*) c FROM attendance WHERE date = date('now') GROUP BY status`),
+    db.prepare(`SELECT status, COUNT(*) c FROM attendance WHERE date = ? GROUP BY status`).bind(todayStr()),
     db.prepare(`SELECT COALESCE(SUM(CASE WHEN type='new' THEN parts_count END),0) parts, COUNT(*) entries FROM memorization`),
-    db.prepare(`SELECT date, SUM(CASE WHEN status='present' THEN 1 ELSE 0 END) present, SUM(CASE WHEN status='absent' THEN 1 ELSE 0 END) absent, SUM(CASE WHEN status='late' THEN 1 ELSE 0 END) late, SUM(CASE WHEN status='excused' THEN 1 ELSE 0 END) excused, COUNT(*) total FROM attendance WHERE date >= date('now','-6 days') GROUP BY date ORDER BY date`),
+    db.prepare(`SELECT date, SUM(CASE WHEN status='present' THEN 1 ELSE 0 END) present, SUM(CASE WHEN status='absent' THEN 1 ELSE 0 END) absent, SUM(CASE WHEN status='late' THEN 1 ELSE 0 END) late, SUM(CASE WHEN status='excused' THEN 1 ELSE 0 END) excused, COUNT(*) total FROM attendance WHERE date >= ? GROUP BY date ORDER BY date`).bind(daysAgoStr(6)),
     db.prepare(`SELECT c.name, COUNT(s.id) students FROM circles c LEFT JOIN students s ON s.circle_id = c.id AND s.active = 1 GROUP BY c.id ORDER BY c.id`),
-    db.prepare(`SELECT evaluation, COUNT(*) c FROM memorization WHERE evaluation IS NOT NULL AND date >= date('now','-30 days') GROUP BY evaluation`),
+    db.prepare(`SELECT evaluation, COUNT(*) c FROM memorization WHERE evaluation IS NOT NULL AND date >= ? GROUP BY evaluation`).bind(daysAgoStr(30)),
   ])
   const todayRows = todayAtt.results as any[]
   const todayTotal = todayRows.reduce((a, r) => a + r.c, 0)
@@ -258,7 +267,8 @@ app.get('/api/students/:id', requireAuth, async (c) => {
   if (u.role === 'parent' && s.parent_user_id !== u.id) return c.json({ error: 'لا تملك الصلاحية' }, 403)
   if (u.role === 'teacher') {
     const cid = await teacherCircleId(c.env.DB, u.id)
-    if (s.circle_id !== cid) return c.json({ error: 'لا تملك الصلاحية' }, 403)
+    // cid == null يمنع أيضاً حالة «معلم بلا حلقة + طالب بلا حلقة» (كلاهما null كان يمر!)
+    if (cid == null || s.circle_id !== cid) return c.json({ error: 'لا تملك الصلاحية' }, 403)
   }
   const [attendance, memorization, achievements, attSummary, parts] = await c.env.DB.batch([
     c.env.DB.prepare('SELECT * FROM attendance WHERE student_id = ? ORDER BY date DESC LIMIT 60').bind(id),
@@ -385,7 +395,7 @@ app.delete('/api/circles/:id', requireRole('admin'), async (c) => {
 // ───────── الحضور ─────────
 // جلب حضور يوم معيّن (المعلم: حلقته فقط)
 app.get('/api/attendance', requireAuth, async (c) => {
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
+  const date = c.req.query('date') || todayStr()
   const u = c.get('user')
   let circleId = c.req.query('circle_id')
   if (u.role === 'teacher') {
@@ -405,7 +415,7 @@ app.get('/api/attendance', requireAuth, async (c) => {
 // حفظ حضور جماعي ليوم واحد
 app.post('/api/attendance', requireRole('admin', 'teacher'), async (c) => {
   const b = await c.req.json().catch(() => ({}))
-  const date = isDate(b.date) ? b.date : new Date().toISOString().slice(0, 10)
+  const date = isDate(b.date) ? b.date : todayStr()
   const items: any[] = Array.isArray(b.items) ? b.items.slice(0, 500) : []
   const u = c.get('user')
   if (!items.length) return c.json({ error: 'لا توجد بيانات' }, 400)
@@ -458,7 +468,7 @@ app.post('/api/memorization', requireRole('admin', 'teacher'), async (c) => {
   if (!(await teacherOwnsStudent(c.env.DB, u, b.student_id))) {
     return c.json({ error: 'هذا الطالب ليس ضمن حلقتك' }, 403)
   }
-  const date = isDate(b.date) ? b.date : new Date().toISOString().slice(0, 10)
+  const date = isDate(b.date) ? b.date : todayStr()
   const parts = clampNum(b.parts_count ?? 0, 0, 1) ?? 0
   const evaluation = ['excellent', 'very_good', 'good', 'needs_review'].includes(b.evaluation) ? b.evaluation : null
   const r = await c.env.DB.prepare(
@@ -488,8 +498,8 @@ app.delete('/api/memorization/:id', requireRole('admin', 'teacher'), async (c) =
 
 // ───────── التقارير ─────────
 app.get('/api/reports/center', requireRole('admin'), async (c) => {
-  const from = c.req.query('from') || new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10)
-  const to = c.req.query('to') || new Date().toISOString().slice(0, 10)
+  const from = c.req.query('from') || daysAgoStr(30)
+  const to = c.req.query('to') || todayStr()
   const [att, mem, circles] = await c.env.DB.batch([
     c.env.DB.prepare(`SELECT date, status, COUNT(*) c FROM attendance WHERE date BETWEEN ? AND ? GROUP BY date, status ORDER BY date`).bind(from, to),
     c.env.DB.prepare(`SELECT m.date, s.name student_name, m.type, m.surah_from, m.surah_to, m.evaluation, m.parts_count FROM memorization m JOIN students s ON s.id = m.student_id WHERE m.date BETWEEN ? AND ? ORDER BY m.date DESC LIMIT 300`).bind(from, to),
@@ -505,8 +515,8 @@ app.get('/api/reports/center', requireRole('admin'), async (c) => {
 
 app.get('/api/reports/student/:id', requireAuth, async (c) => {
   const id = c.req.param('id')
-  const from = c.req.query('from') || new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10)
-  const to = c.req.query('to') || new Date().toISOString().slice(0, 10)
+  const from = c.req.query('from') || daysAgoStr(30)
+  const to = c.req.query('to') || todayStr()
   const s = await c.env.DB.prepare(
     `SELECT s.*, c.name circle_name, t.name teacher_name FROM students s
      LEFT JOIN circles c ON c.id = s.circle_id LEFT JOIN teachers t ON t.id = c.teacher_id WHERE s.id = ?`
@@ -525,8 +535,8 @@ app.get('/api/reports/student/:id', requireAuth, async (c) => {
 
 app.get('/api/reports/circle/:id', requireRole('admin'), async (c) => {
   const id = c.req.param('id')
-  const from = c.req.query('from') || new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10)
-  const to = c.req.query('to') || new Date().toISOString().slice(0, 10)
+  const from = c.req.query('from') || daysAgoStr(30)
+  const to = c.req.query('to') || todayStr()
   const circle = await c.env.DB.prepare(
     'SELECT c.*, t.name teacher_name FROM circles c LEFT JOIN teachers t ON t.id = c.teacher_id WHERE c.id = ?'
   ).bind(id).first<any>()
@@ -568,13 +578,7 @@ app.get('*', (c) => {
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" type="image/png" href="/static/icon-192.png">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = { theme: { extend: { colors: {
-      primary: {50:'#eef7f5',100:'#d7ece8',200:'#b0d9d1',300:'#7fc0b4',400:'#4ba392',500:'#0f766e',600:'#0d5c4d',700:'#0a4a3f',800:'#083a32',900:'#062c26'},
-      gold: {50:'#fbf8ec',100:'#f5edc8',200:'#ecdb8f',300:'#e0c55a',400:'#d4af37',500:'#b8942a',600:'#96761f',700:'#775d1b',800:'#644d1d',900:'#55411c'}
-    }, fontFamily: { cairo: ['Cairo','sans-serif'], amiri: ['Amiri','serif'] } } } }
-  </script>
+  <link rel="stylesheet" href="/static/tailwind.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;600;700;900&family=Amiri:wght@400;700&display=swap" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/css/all.min.css" rel="stylesheet">
