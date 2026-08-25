@@ -44,8 +44,7 @@ jobs:
           echo "CLOUDFLARE_ACCOUNT_ID=${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" >> $GITHUB_ENV
 
       - name: Verify token
-        run: |
-          npx wrangler whoami 2>&1 | tee /tmp/whoami.log
+        run: npx wrangler whoami
 
       - name: Get or create D1 database
         id: db
@@ -87,26 +86,29 @@ jobs:
             content = content.replace(/\"database_id\":\s*\"local-dev-placeholder\"/, '\"database_id\": \"' + process.env.DB_ID + '\"');
             fs.writeFileSync('wrangler.jsonc', content);
             console.log('Updated wrangler.jsonc');
-            console.log(fs.readFileSync('wrangler.jsonc', 'utf8'));
           "
         env:
           DB_ID: ${{ steps.db.outputs.db_id }}
 
+      - name: Create Cloudflare Pages project (if not exists)
+        run: |
+          echo "=== Checking for existing Pages project ==="
+          npx wrangler pages project list 2>&1
+          if npx wrangler pages project list 2>&1 | grep -q "markaz-alsunna"; then
+            echo "Project markaz-alsunna already exists"
+          else
+            echo "=== Creating Pages project markaz-alsunna ==="
+            npx wrangler pages project create markaz-alsunna --production-branch=main
+          fi
+
       - name: Build
-        run: npm run build 2>&1 | tee /tmp/build.log
+        run: npm run build
 
       - name: Deploy to Cloudflare Pages
-        id: deploy
-        run: |
-          set +e
-          npx wrangler pages deploy 2>&1 | tee /tmp/deploy.log
-          DEPLOY_EXIT=$?
-          echo "deploy_exit=$DEPLOY_EXIT" >> $GITHUB_OUTPUT
-          cat /tmp/deploy.log
-          exit $DEPLOY_EXIT
+        run: npx wrangler pages deploy --branch=main
 
       - name: Apply remote migrations
-        run: npm run db:migrate:remote 2>&1 | tee /tmp/migrate.log
+        run: npm run db:migrate:remote
 
       - name: Commit wrangler.jsonc with real database_id
         run: |
@@ -130,20 +132,14 @@ jobs:
       - name: Verify deployment
         if: always()
         run: |
-          sleep 10
+          sleep 15
           CODE=$(curl -s -o /dev/null -w "%{http_code}" https://markaz-alsunna.pages.dev || echo "000")
           echo "HTTP status: $CODE"
           echo "::notice::Deployment verification HTTP status: $CODE"
 
-      - name: Upload all logs as artifact
+      - name: Upload database_id artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: deploy-logs
-          path: |
-            database_id.txt
-            /tmp/whoami.log
-            /tmp/build.log
-            /tmp/deploy.log
-            /tmp/migrate.log
-            wrangler.jsonc
+          name: database-id
+          path: database_id.txt
