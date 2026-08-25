@@ -43,10 +43,10 @@ jobs:
       - name: Verify token
         run: npx wrangler whoami
 
-      - name: Check for existing D1 database
-        id: check_db
+      - name: Get or create D1 database
+        id: db
         run: |
-          echo "Listing existing D1 databases..."
+          echo "=== Listing existing D1 databases ==="
           npx wrangler d1 list --json > /tmp/d1list.json 2>/dev/null || echo "[]" > /tmp/d1list.json
           cat /tmp/d1list.json
           DB_ID=$(node -e "
@@ -55,39 +55,23 @@ jobs:
             const found = Array.isArray(data) ? data.find(d => d.name === 'webapp-production') : null;
             if (found) { console.log(found.uuid); }
           ")
-          echo "Found DB_ID: ${DB_ID:-none}"
-          echo "db_id=${DB_ID}" >> $GITHUB_OUTPUT
-          echo "has_db=$(if [ -n "$DB_ID" ]; then echo true; else echo false; fi)" >> $GITHUB_OUTPUT
-
-      - name: Create D1 database
-        if: steps.check_db.outputs.has_db != 'true'
-        id: create_db
-        run: |
-          echo "Creating D1 database webapp-production..."
-          npx wrangler d1 create webapp-production > /tmp/d1create.txt 2>&1
-          cat /tmp/d1create.txt
-          DB_ID=$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' /tmp/d1create.txt | head -1)
           if [ -z "$DB_ID" ]; then
-            DB_ID=$(grep -oE 'database_id\s*=\s*"[^"]+"' /tmp/d1create.txt | grep -oE '[0-9a-f-]{36}')
+            echo "=== Creating D1 database webapp-production ==="
+            npx wrangler d1 create webapp-production > /tmp/d1create.txt 2>&1
+            cat /tmp/d1create.txt
+            DB_ID=$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' /tmp/d1create.txt | head -1)
+            if [ -z "$DB_ID" ]; then
+              DB_ID=$(grep -oE 'database_id\s*=\s*"[^"]+"' /tmp/d1create.txt | grep -oE '[0-9a-f-]{36}')
+            fi
           fi
-          echo "Extracted DB_ID: $DB_ID"
-          echo "db_id=$DB_ID" >> $GITHUB_OUTPUT
-
-      - name: Set final database_id
-        id: final_db
-        run: |
-          DB_ID="${{ steps.check_db.outputs.db_id }}"
-          if [ -z "$DB_ID" ]; then
-            DB_ID="${{ steps.create_db.outputs.db_id }}"
-          fi
-          echo "Final database_id: $DB_ID"
+          echo "DATABASE_ID=$DB_ID"
           echo "::notice::database_id=$DB_ID"
           echo "db_id=$DB_ID" >> $GITHUB_OUTPUT
           echo "$DB_ID" > database_id.txt
 
       - name: Update wrangler.jsonc with database_id
         run: |
-          DB_ID="${{ steps.final_db.outputs.db_id }}"
+          DB_ID="${{ steps.db.outputs.db_id }}"
           if [ -z "$DB_ID" ]; then
             echo "ERROR: No database_id obtained"
             exit 1
@@ -102,46 +86,27 @@ jobs:
             console.log(fs.readFileSync('wrangler.jsonc', 'utf8'));
           "
         env:
-          DB_ID: ${{ steps.final_db.outputs.db_id }}
+          DB_ID: ${{ steps.db.outputs.db_id }}
 
-      - name: Build (tailwind + vite)
-        id: build
-        run: |
-          set -x
-          npm run tailwind:css
-          npx vite build
-        continue-on-error: true
-
-      - name: Show dist contents
-        if: always()
-        run: |
-          echo "=== dist contents ==="
-          ls -la dist/ 2>/dev/null || echo "no dist directory"
-          ls -la dist/_worker/ 2>/dev/null || echo "no dist/_worker"
+      - name: Build
+        run: npm run build
 
       - name: Deploy to Cloudflare Pages
-        id: deploy
-        if: steps.build.outcome == 'success'
-        run: |
-          set -x
-          npx wrangler pages deploy
-        continue-on-error: true
+        run: npx wrangler pages deploy
 
       - name: Apply remote migrations
-        if: steps.deploy.outcome != 'skipped' && steps.deploy.outcome != 'failure'
         run: npm run db:migrate:remote
 
       - name: Create admin account
-        if: github.event.inputs.create_admin == 'true' && steps.deploy.outcome != 'skipped' && steps.deploy.outcome != 'failure'
+        if: github.event.inputs.create_admin == 'true'
         run: |
-          if [ -z "${{ github.event.inputs.admin_password }}" ] || [ "${{ github.event.inputs.admin_password }}" = "" ]; then
+          if [ -z "${{ github.event.inputs.admin_password }}" ]; then
             echo "Skipping admin creation: no password provided"
             exit 0
           fi
           npm run create-admin -- "${{ github.event.inputs.admin_name }}" "${{ github.event.inputs.admin_email }}" "${{ github.event.inputs.admin_password }}"
 
       - name: Verify deployment
-        if: always()
         run: |
           sleep 10
           CODE=$(curl -s -o /dev/null -w "%{http_code}" https://markaz-alsunna.pages.dev || echo "000")
@@ -149,16 +114,7 @@ jobs:
           echo "::notice::Deployment verification HTTP status: $CODE"
 
       - name: Upload database_id artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: database-id
           path: database_id.txt
-
-      - name: Fail job if build failed
-        if: steps.build.outcome == 'failure'
-        run: exit 1
-
-      - name: Fail job if deploy failed
-        if: steps.deploy.outcome == 'failure'
-        run: exit 1
