@@ -1,0 +1,132 @@
+name: Deploy to Cloudflare Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_admin:
+        description: 'Create admin account after deploy'
+        required: false
+        default: 'false'
+      admin_name:
+        description: 'Admin display name'
+        required: false
+        default: ''
+      admin_email:
+        description: 'Admin email'
+        required: false
+        default: ''
+      admin_password:
+        description: 'Admin password (min 8 chars)'
+        required: false
+        default: ''
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure Cloudflare credentials
+        run: |
+          echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> $GITHUB_ENV
+          echo "CLOUDFLARE_ACCOUNT_ID=${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" >> $GITHUB_ENV
+
+      - name: Verify token
+        run: npx wrangler whoami
+
+      - name: Check for existing D1 database
+        id: check_db
+        run: |
+          echo "Listing existing D1 databases..."
+          npx wrangler d1 list --json > /tmp/d1list.json 2>/dev/null || echo "[]" > /tmp/d1list.json
+          cat /tmp/d1list.json
+          DB_ID=$(node -e "
+            let data=[];
+            try { data = require('/tmp/d1list.json'); } catch {}
+            const found = Array.isArray(data) ? data.find(d => d.name === 'webapp-production') : null;
+            if (found) { console.log(found.uuid); }
+          ")
+          echo "Found DB_ID: ${DB_ID:-none}"
+          echo "db_id=${DB_ID}" >> $GITHUB_OUTPUT
+          echo "has_db=$(if [ -n "$DB_ID" ]; then echo true; else echo false; fi)" >> $GITHUB_OUTPUT
+
+      - name: Create D1 database
+        if: steps.check_db.outputs.has_db != 'true'
+        id: create_db
+        run: |
+          echo "Creating D1 database webapp-production..."
+          npx wrangler d1 create webapp-production > /tmp/d1create.txt 2>&1
+          cat /tmp/d1create.txt
+          DB_ID=$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' /tmp/d1create.txt | head -1)
+          if [ -z "$DB_ID" ]; then
+            DB_ID=$(grep -oE 'database_id\s*=\s*"[^"]+"' /tmp/d1create.txt | grep -oE '[0-9a-f-]{36}')
+          fi
+          echo "Extracted DB_ID: $DB_ID"
+          echo "db_id=$DB_ID" >> $GITHUB_OUTPUT
+
+      - name: Set final database_id
+        id: final_db
+        run: |
+          DB_ID="${{ steps.check_db.outputs.db_id }}"
+          if [ -z "$DB_ID" ]; then
+            DB_ID="${{ steps.create_db.outputs.db_id }}"
+          fi
+          echo "Final database_id: $DB_ID"
+          echo "db_id=$DB_ID" >> $GITHUB_OUTPUT
+          echo "$DB_ID" > database_id.txt
+
+      - name: Update wrangler.jsonc with database_id
+        run: |
+          DB_ID="${{ steps.final_db.outputs.db_id }}"
+          if [ -z "$DB_ID" ]; then
+            echo "ERROR: No database_id obtained"
+            exit 1
+          fi
+          echo "Updating wrangler.jsonc with database_id: $DB_ID"
+          node -e "
+            const fs = require('fs');
+            let content = fs.readFileSync('wrangler.jsonc', 'utf8');
+            content = content.replace(/\"database_id\":\s*\"local-dev-placeholder\"/, '\"database_id\": \"' + process.env.DB_ID + '\"');
+            fs.writeFileSync('wrangler.jsonc', content);
+            console.log('Updated wrangler.jsonc');
+            console.log(fs.readFileSync('wrangler.jsonc', 'utf8'));
+          "
+        env:
+          DB_ID: ${{ steps.final_db.outputs.db_id }}
+
+      - name: Build and deploy
+        run: npm run deploy
+
+      - name: Apply remote migrations
+        run: npm run db:migrate:remote
+
+      - name: Create admin account
+        if: github.event.inputs.create_admin == 'true'
+        run: |
+          if [ -z "${{ github.event.inputs.admin_password }}" ] || [ "${{ github.event.inputs.admin_password }}" = "" ]; then
+            echo "Skipping admin creation: no password provided"
+            exit 0
+          fi
+          npm run create-admin -- "${{ github.event.inputs.admin_name }}" "${{ github.event.inputs.admin_email }}" "${{ github.event.inputs.admin_password }}"
+
+      - name: Verify deployment
+        run: |
+          sleep 10
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" https://markaz-alsunna.pages.dev || echo "000")
+          echo "HTTP status: $CODE"
+          echo "::notice::Deployment verification HTTP status: $CODE"
+
+      - name: Upload database_id artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: database-id
+          path: database_id.txt
