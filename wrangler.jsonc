@@ -10,7 +10,7 @@
     {
       "binding": "DB",
       "database_name": "webapp-production",
-      "database_id": "local-dev-placeholder",
+      "database_id": "875ba0cb-7f3f-4b5c-aa90-4960fa8bd154",
       "migrations_dir": "migrations"
     }
   ]
