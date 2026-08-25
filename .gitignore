@@ -1,5 +1,6 @@
 # prod
 dist/
+public/static/tailwind.css
 
 # dev
 .yarn/

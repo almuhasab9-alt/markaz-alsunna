@@ -1,7 +1,9 @@
 // Service Worker — مركز السنة
 // يخزّن الواجهة والملفات الثابتة للعمل دون إنترنت، ويمرّر طلبات API للشبكة دائماً
-const CACHE = 'markaz-alsunna-v1'
-const STATIC = ['/', '/static/app.js', '/static/logo.png', '/static/icon-192.png', '/static/icon-512.png', '/manifest.webmanifest']
+const CACHE = 'markaz-alsunna-v2'
+const STATIC = ['/', '/static/app.js', '/static/tailwind.css', '/static/logo.png', '/static/icon-192.png', '/static/icon-512.png', '/manifest.webmanifest']
+// موارد خارجية (خطوط، Chart.js، الأيقونات) تُخزَّن بعد أول تحميل ناجح ليعمل التطبيق دون إنترنت
+const CDN = /^(\w+\.)?(jsdelivr\.net|fonts\.googleapis\.com|fonts\.gstatic\.com)$/
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(STATIC)).then(() => self.skipWaiting()))
@@ -27,6 +29,10 @@ self.addEventListener('fetch', (e) => {
     caches.match(e.request).then((cached) => {
       const fetched = fetch(e.request).then((res) => {
         if (res.ok && url.origin === location.origin) {
+          const clone = res.clone()
+          caches.open(CACHE).then((c) => c.put(e.request, clone))
+        } else if (res.type === 'opaque' && CDN.test(url.hostname)) {
+          // استجابات CDN (script/link بلا crossorigin) — ok=false لكن صالحة للتخزين والعمل دون إنترنت
           const clone = res.clone()
           caches.open(CACHE).then((c) => c.put(e.request, clone))
         }

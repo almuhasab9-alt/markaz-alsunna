@@ -26,7 +26,10 @@ export async function hashPassword(password: string, salt: string): Promise<stri
 
 export async function verifyPassword(password: string, salt: string, hash: string): Promise<boolean> {
   const computed = await pbkdf2Hex(password, salt)
-  return computed === hash
+  if (computed.length !== hash.length) return false
+  // مقارنة زمنية-ثابتة (متوفرة في Workers runtime) — تمنع استنتاج كلمة المرور من زمن المقارنة
+  const enc = new TextEncoder()
+  return (crypto.subtle as any).timingSafeEqual(enc.encode(computed), enc.encode(hash))
 }
 
 export function randomToken(): string {
